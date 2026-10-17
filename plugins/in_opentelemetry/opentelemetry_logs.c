@@ -30,6 +30,7 @@
 
 #include "opentelemetry_protobuf.h"
 #include "opentelemetry.h"
+#include "opentelemetry_logs.h"
 #include "opentelemetry_utils.h"
 
 /*
@@ -655,7 +656,10 @@ static int binary_payload_to_msgpack(struct flb_opentelemetry *ctx,
                 goto binary_payload_to_msgpack_end;
             }
 
-            flb_log_event_encoder_group_header_end(encoder);
+            ret = flb_log_event_encoder_group_header_end(encoder);
+            if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+                goto binary_payload_to_msgpack_end;
+            }
 
             for (log_record_index=0; log_record_index < scope_log->n_log_records; log_record_index++) {
                 ret = flb_log_event_encoder_begin_record(encoder);
@@ -757,6 +761,9 @@ static int binary_payload_to_msgpack(struct flb_opentelemetry *ctx,
                     if (ret == FLB_EVENT_ENCODER_SUCCESS) {
                         (*record_count)++;
                     }
+                    else {
+                        goto binary_payload_to_msgpack_end;
+                    }
                 }
                 else {
                     flb_plg_error(ctx->ins, "marshalling error");
@@ -764,7 +771,10 @@ static int binary_payload_to_msgpack(struct flb_opentelemetry *ctx,
                 }
             }
 
-            flb_log_event_encoder_group_end(encoder);
+            ret = flb_log_event_encoder_group_end(encoder);
+            if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+                goto binary_payload_to_msgpack_end;
+            }
 
         }
     }
@@ -792,19 +802,55 @@ int opentelemetry_process_logs(struct flb_opentelemetry *ctx,
                                size_t tag_len,
                                void *data, size_t size)
 {
+    size_t remaining = ctx->logs_max_size;
+
+    return opentelemetry_process_logs_with_budget(ctx, content_type, tag, tag_len,
+                                                  data, size, &remaining);
+}
+
+int opentelemetry_process_logs_with_budget(struct flb_opentelemetry *ctx,
+                                           flb_sds_t content_type,
+                                           flb_sds_t tag, size_t tag_len,
+                                           void *data, size_t size,
+                                           size_t *remaining)
+{
+    int ret;
+    size_t record_count;
+    struct flb_log_event_encoder *encoder;
+
+    ret = opentelemetry_encode_logs_with_budget(ctx, content_type, tag, tag_len,
+                                                data, size, remaining,
+                                                &encoder, &record_count);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ret = opentelemetry_ingest_encoded_logs(ctx, tag, encoder, record_count);
+    flb_log_event_encoder_destroy(encoder);
+    return ret;
+}
+
+int opentelemetry_encode_logs_with_budget(struct flb_opentelemetry *ctx,
+                                          flb_sds_t content_type,
+                                          flb_sds_t tag, size_t tag_len,
+                                          void *data, size_t size,
+                                          size_t *remaining,
+                                          struct flb_log_event_encoder **result,
+                                          size_t *record_count)
+{
     int ret = -1;
     int is_proto = FLB_FALSE; /* default to JSON */
     int error_status = 0;
     char *buf;
     uint8_t *payload;
     uint64_t payload_size;
-    size_t record_count;
     struct flb_log_event_encoder *encoder;
 
     buf = (char *) data;
     payload = data;
     payload_size = size;
-    record_count = 0;
+    *result = NULL;
+    *record_count = 0;
 
     /* Detect the type of payload */
     if (content_type) {
@@ -828,12 +874,13 @@ int opentelemetry_process_logs(struct flb_opentelemetry *ctx,
     if (encoder == NULL) {
         return -1;
     }
+    encoder->output_limit = *remaining;
 
     if (is_proto == FLB_TRUE) {
         ret = binary_payload_to_msgpack(ctx, encoder,
                                         tag, tag_len,
                                         (uint8_t *) payload, payload_size,
-                                        &record_count);
+                                        record_count);
         if (ret < 0) {
             flb_plg_error(ctx->ins, "failed to process logs from protobuf payload");
         }
@@ -853,45 +900,52 @@ int opentelemetry_process_logs(struct flb_opentelemetry *ctx,
     }
 
     if (ret >= 0) {
-        if (opentelemetry_uses_worker_ingress_queue(ctx)) {
-            size_t allocation_size;
-            void *resized_buffer;
-
-            allocation_size = encoder->buffer.alloc;
-
-            if (allocation_size > encoder->output_length) {
-                resized_buffer = flb_realloc(encoder->output_buffer,
-                                             encoder->output_length);
-                if (resized_buffer != NULL) {
-                    encoder->buffer.data = resized_buffer;
-                    encoder->output_buffer = resized_buffer;
-                    encoder->buffer.alloc = encoder->output_length;
-                    allocation_size = encoder->output_length;
-                }
-            }
-
-            ret = opentelemetry_ingest_logs_take(ctx,
-                                                 record_count,
-                                                 tag,
-                                                 flb_sds_len(tag),
-                                                 encoder->output_buffer,
-                                                 encoder->output_length,
-                                                 allocation_size);
-            flb_log_event_encoder_claim_internal_buffer_ownership(encoder);
-        }
-        else {
-            ret = opentelemetry_ingest_logs(ctx,
-                                            tag,
-                                            flb_sds_len(tag),
-                                            encoder->output_buffer,
-                                            encoder->output_length);
-        }
-
-        if (ret != 0) {
-            flb_plg_error(ctx->ins, "failed to append logs to the input buffer");
-        }
+        *remaining -= encoder->output_length;
+        *result = encoder;
+        return 0;
     }
 
     flb_log_event_encoder_destroy(encoder);
+    return ret;
+}
+
+int opentelemetry_ingest_encoded_logs(struct flb_opentelemetry *ctx,
+                                     flb_sds_t tag,
+                                     struct flb_log_event_encoder *encoder,
+                                     size_t record_count)
+{
+    int ret;
+
+    if (opentelemetry_uses_worker_ingress_queue(ctx)) {
+        size_t allocation_size;
+        void *resized_buffer;
+
+        allocation_size = encoder->buffer.alloc;
+
+        if (allocation_size > encoder->output_length) {
+            resized_buffer = flb_realloc(encoder->output_buffer,
+                                         encoder->output_length);
+            if (resized_buffer != NULL) {
+                encoder->buffer.data = resized_buffer;
+                encoder->output_buffer = resized_buffer;
+                encoder->buffer.alloc = encoder->output_length;
+                allocation_size = encoder->output_length;
+            }
+        }
+
+        ret = opentelemetry_ingest_logs_take(ctx, record_count, tag, flb_sds_len(tag),
+                                             encoder->output_buffer, encoder->output_length,
+                                             allocation_size);
+        flb_log_event_encoder_claim_internal_buffer_ownership(encoder);
+    }
+    else {
+        ret = opentelemetry_ingest_logs(ctx, tag, flb_sds_len(tag),
+                                       encoder->output_buffer, encoder->output_length);
+    }
+
+    if (ret != 0) {
+        flb_plg_error(ctx->ins, "failed to append logs to the input buffer");
+    }
+
     return ret;
 }

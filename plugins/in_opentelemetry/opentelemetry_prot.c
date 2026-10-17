@@ -700,6 +700,8 @@ static int send_ingress_busy_response_ng(struct flb_http_response *response,
 struct otlp_grpc_frame {
     char *payload;
     size_t size;
+    size_t log_record_count;
+    struct flb_log_event_encoder *log_encoder;
     int allocated;
     struct cfl_list _head;
 };
@@ -714,6 +716,9 @@ static void destroy_grpc_frames(struct cfl_list *frames)
         frame = cfl_list_entry(head, struct otlp_grpc_frame, _head);
         if (frame->allocated) {
             flb_free(frame->payload);
+        }
+        if (frame->log_encoder != NULL) {
+            flb_log_event_encoder_destroy(frame->log_encoder);
         }
         cfl_list_del(head);
         flb_free(frame);
@@ -838,12 +843,16 @@ int opentelemetry_prot_handle_ng(struct flb_http_request *request,
     char payload_type;
     char *payload = NULL;
     size_t payload_size = 0;
+    size_t logs_remaining;
     struct flb_opentelemetry *context;
     struct cfl_list frames;
     struct otlp_grpc_frame *frame;
+    struct cfl_list *head;
+    struct otlp_grpc_frame *staged_frame;
 
     cfl_list_init(&frames);
     context = (struct flb_opentelemetry *) response->stream->user_data;
+    logs_remaining = context->logs_max_size;
 
     if (request->path == NULL || request->path[0] != '/') {
         send_response_ng(response, 400, "error: invalid request\n");
@@ -1018,8 +1027,28 @@ next_grpc_message:
             goto cleanup;
         }
 
-        ret = opentelemetry_process_logs(context, request->content_type, tag, flb_sds_len(tag),
-                                         payload, payload_size);
+        if (grpc_request == FLB_TRUE) {
+            if (frame->log_encoder == NULL) {
+                /* Validate the generated size of every frame before any ingestion. */
+                cfl_list_foreach(head, &frames) {
+                    staged_frame = cfl_list_entry(head, struct otlp_grpc_frame, _head);
+                    ret = opentelemetry_encode_logs_with_budget(
+                            context, request->content_type, tag, flb_sds_len(tag),
+                            staged_frame->payload, staged_frame->size, &logs_remaining,
+                            &staged_frame->log_encoder, &staged_frame->log_record_count);
+                    if (ret != 0) {
+                        goto cleanup;
+                    }
+                }
+            }
+            ret = opentelemetry_ingest_encoded_logs(context, tag, frame->log_encoder,
+                                                    frame->log_record_count);
+        }
+        else {
+            ret = opentelemetry_process_logs_with_budget(context, request->content_type,
+                                                          tag, flb_sds_len(tag),
+                                                          payload, payload_size, &logs_remaining);
+        }
     }
     else if (context->profile_support_enabled &&
              is_profiles_export_path(request->path) == FLB_TRUE) {
@@ -1043,6 +1072,9 @@ cleanup:
         frame = cfl_list_entry_first(&frames, struct otlp_grpc_frame, _head);
         if (frame->allocated) {
             flb_free(frame->payload);
+        }
+        if (frame->log_encoder != NULL) {
+            flb_log_event_encoder_destroy(frame->log_encoder);
         }
         cfl_list_del(&frame->_head);
         flb_free(frame);

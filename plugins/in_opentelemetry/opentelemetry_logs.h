@@ -28,4 +28,23 @@ int opentelemetry_process_logs(struct flb_opentelemetry *ctx,
                                size_t tag_len,
                                void *data, size_t size);
 
+int opentelemetry_process_logs_with_budget(struct flb_opentelemetry *ctx,
+                                           flb_sds_t content_type,
+                                           flb_sds_t tag, size_t tag_len,
+                                           void *data, size_t size,
+                                           size_t *remaining);
+
+int opentelemetry_encode_logs_with_budget(struct flb_opentelemetry *ctx,
+                                          flb_sds_t content_type,
+                                          flb_sds_t tag, size_t tag_len,
+                                          void *data, size_t size,
+                                          size_t *remaining,
+                                          struct flb_log_event_encoder **encoder,
+                                          size_t *record_count);
+
+int opentelemetry_ingest_encoded_logs(struct flb_opentelemetry *ctx,
+                                     flb_sds_t tag,
+                                     struct flb_log_event_encoder *encoder,
+                                     size_t record_count);
+
 #endif
